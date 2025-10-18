@@ -614,7 +614,8 @@ class EventDispatcher:
             #self.move_relative({"z": -85.0})
             pass
 
-        self.set_shown_image(ShownImage.UV_FOCUS)
+        # self.set_shown_image(ShownImage.UV_FOCUS)
+        self.set_shown_image(ShownImage.CLEAR) # enter uv mode: don't project uv
 
         if mode_switch_autofocus and self.autofocus_on_mode_switch:
             self.non_blocking_delay(2.0)
@@ -1281,7 +1282,8 @@ class UvFocusFrame: # crosses
         self.uv_focus_frame = ImageSelectFrame(
             self.frame,
             "UV Focus",
-            lambda t: event_dispatcher.set_uv_focus_image(self.uv_focus_image()),
+            self._on_uv_focus_change,
+            # lambda t: event_dispatcher.set_uv_focus_image(self.uv_focus_image),
             # import_command in ImageSelectFrame --> on_select in PredefinedImageSelector
             predefined_images=uv_focus_predefined
         )
@@ -1291,9 +1293,10 @@ class UvFocusFrame: # crosses
         event_dispatcher.add_event_listener(Event.SHOWN_IMAGE_CHANGED, self._on_shown_image_changed)
 
     def _on_uv_focus_change(self, _):
-        """Handle UV focus image selection"""
+        """Handle UV focus image selection and projection"""
         if self.uv_focus_frame.thumb.image:
             self.event_dispatcher.set_uv_focus_image(self.uv_focus_frame.thumb.image)
+            self.event_dispatcher.set_shown_image(ShownImage.UV_FOCUS)
 
     def _on_shown_image_changed(self):
         """Handle visual highlighting when shown image changes"""
@@ -1707,7 +1710,7 @@ class UvModeFrame:
         self.uv_focus_frame = UvFocusFrame(self.left_frame, event_dispatcher)
         self.uv_focus_frame.frame.grid(row=0, column=0, pady=(10,0))
 
-        # Stage position controls (middle)  
+        # Stage position controls (middle)
         self.stage_position_frame = StagePositionFrame(self.middle_frame, event_dispatcher)
         self.stage_position_frame.frame.grid(row=0, column=0, sticky="n")
         
@@ -2070,6 +2073,7 @@ class TilingFrame:
         self.abort_tiling_button = ttk.Button(self.frame, text="Abort Tiling", command=on_abort, state="disabled")
         self.abort_tiling_button.grid(row=3, column=0)
 
+
 class ProjectorDisplayFrame:
     """Frame to display what the projector is currently showing"""
     
@@ -2100,10 +2104,13 @@ class ProjectorDisplayFrame:
         event_dispatcher.add_event_listener(Event.SHOWN_IMAGE_CHANGED, self._update_display)
         event_dispatcher.add_event_listener(Event.PATTERN_IMAGE_CHANGED, self._update_display)
         event_dispatcher.add_event_listener(Event.IMAGE_ADJUST_CHANGED, self._update_display)
+        event_dispatcher.add_event_listener(Event.PATTERNING_BUSY_CHANGED, self._update_display)
+        
+        # Force initial update
+        self.event_dispatcher.root.after(100, self._update_display)
         
     def _update_display(self):
         """Update the display when projector content changes"""
-        img = self.event_dispatcher.current_image
         shown_image = self.event_dispatcher.shown_image
         
         # Update status text
@@ -2116,18 +2123,56 @@ class ProjectorDisplayFrame:
         }
         self.status_var.set(status_map.get(shown_image, "Status: Unknown"))
         
+        # Get the appropriate processed image based on mode
+        # Note: When patterning, we check patterning_busy flag as well
+        img = None
+        if shown_image == ShownImage.RED_FOCUS:
+            img = self.event_dispatcher.red_focus.processed()
+        # pattern case above uv focus case: when set_patterning_busy(True) is called,
+        # shown_image is never changed to PATTERN during patterning - it stays as UV_FOCUS
+        elif shown_image == ShownImage.PATTERN or self.event_dispatcher.patterning_busy:
+            img = self.event_dispatcher.pattern.processed()
+        elif shown_image == ShownImage.UV_FOCUS:
+            img = self.event_dispatcher.uv_focus.processed()
+        elif shown_image == ShownImage.FLATFIELD:
+            # Flatfield might not be implemented, use pattern as fallback
+            img = self.event_dispatcher.pattern.processed()
+        
+        # Debug print to help troubleshoot
+        # if self.event_dispatcher.patterning_busy or shown_image == ShownImage.PATTERN:
+        #     if img is not None:
+        #         print(f"Patterning - Image size: {img.size}, mode: {img.mode}")
+        #     else:
+        #         print(f"Patterning - Image is None")
+        
         # Update image
-        if img is None:
+        if img is None or (shown_image == ShownImage.CLEAR and not self.event_dispatcher.patterning_busy):
             # Show black placeholder when clear
             placeholder = Image.new("RGB", self.display_size, "black")
             self.photo = image_to_tk_image(placeholder)
         else:
             # Resize the projector output to fit in display
-            display_img = img.copy()
-            display_img.thumbnail(self.display_size, Image.Resampling.LANCZOS)
-            self.photo = image_to_tk_image(display_img)
+            try:
+                display_img = img.copy()
+                # Check if image is all black
+                import numpy as np
+                img_array = np.array(display_img)
+                is_black = np.all(img_array == 0)
+                # print(f"Image all black: {is_black}, min: {img_array.min()}, max: {img_array.max()}")
+                
+                display_img.thumbnail(self.display_size, Image.Resampling.LANCZOS)
+                self.photo = image_to_tk_image(display_img)
+            except Exception as e:
+                print(f"Error displaying projector image: {e}")
+                import traceback
+                traceback.print_exc()
+                placeholder = Image.new("RGB", self.display_size, "red")
+                self.photo = image_to_tk_image(placeholder)
         
         self.label.configure(image=self.photo)
+        
+        # Schedule periodic updates to catch any missed changes
+        self.event_dispatcher.root.after(500, self._update_display)
 
 class LithographerGui:
     root: Tk
